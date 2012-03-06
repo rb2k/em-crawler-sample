@@ -1,6 +1,10 @@
+require "rubygems"
+require "bundler/setup"
+require 'bundler/setup'
 require "em-resolv-replace"
 require "em-http-request"
 require "em-redis"
+require 'addressable/uri'
 
 class Crawler
 
