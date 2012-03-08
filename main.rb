@@ -8,22 +8,48 @@ require 'addressable/uri'
 
 class Crawler
 
-    def initialize(seed_links)
+    def initialize(seed_links, redis_connection)
+        #Let's compile the regexp once rather than compiling it inline everytime
         @compiled_regexp = Regexp.new(/href.?=.?["']([^\/].*?)["']/i)
+        @redis_connection = redis_connection
         tmp_con = EM::Protocols::Redis.connect({:host => '127.0.0.1', :port => 6379, :db => 0})
         tmp_con.scard('links_to_crawl') do |link_amount|
             seed_links.each {|link| tmp_con.sadd('links_to_crawl', link)} if link_amount.to_i == 0
         end
+        #An array with the timestamp of the last crawl for a certain domain
+        #This will also be in the future for planned requests
+        @domain_crawl_timestamp = {}
+        #force a distance of 2 seconds between http requests (per domain)
     end
 
-    def start_fresh_crawl(redis_connection = nil)
-        redis_connection = EM::Protocols::Redis.connect({:host => '127.0.0.1', :port => 6379, :db => 0}) unless redis_connection
-        redis_connection.spop('links_to_crawl') do |link|
+    def random_crawl_delay
+        #a random delay from 0 to 2 seconds, floating point precision
+        rand(200) / 100.0
+    end
+
+    def start_fresh_crawl()
+        @redis_connection.spop('links_to_crawl') do |link|
             if link
-                crawl_url(link, redis_connection)
+                link_host = Addressable::URI.parse(link).host
+                last_request_for_domain = @domain_crawl_timestamp[link_host].to_f
+                current_delay = random_crawl_delay()
+                if (last_request_for_domain + current_delay) < Time.now.to_f
+                    #The last HTTP request to this domain has been longer ago than our crawl delay
+                    #So we can crawl it immediately
+                    @domain_crawl_timestamp[link_host] = Time.now.to_f
+                    crawl_url(link)
+                else
+                    #The last HTTP request to this domain is still within our waiting period
+                    #We will launch the request in the future
+                    wait_for = last_request_for_domain + current_delay - Time.now.to_f
+                    #Save the point in time when we will crawl the domain again.
+                    @domain_crawl_timestamp[link_host] = Time.now.to_f + wait_for.to_f
+                    EventMachine::Timer.new(wait_for){ crawl_url(link) }
+                end
+                
             else
                 puts "Queue empty, trying again in 10 seconds"
-                EventMachine::Timer.new(10){ start_fresh_crawl(redis_connection) }
+                EventMachine::Timer.new(10){ start_fresh_crawl() }
             end
         end
     end
@@ -44,28 +70,28 @@ class Crawler
         html.match(/<title>(.*)<\/title>/)[1] rescue nil
     end
 
-    def crawl_url(url, redis_connection)
-        redis_connection.sadd('visited_links', url)
-        grab_html(url, redis_connection) do |html_data|
+    def crawl_url(url)
+        @redis_connection.sadd('visited_links', url)
+        grab_html(url) do |html_data|
             links = extract_internal_links(url, html_data)
 
             links.each {|link| 
-                redis_connection.sismember('visited_links', link) do |is_member|
-                    redis_connection.sadd('links_to_crawl', link) unless is_member
+                @redis_connection.sismember('visited_links', link) do |is_member|
+                    @redis_connection.sadd('links_to_crawl', link) unless is_member
                 end
             }
             
             title = extract_title(html_data)
-            redis_connection.scard('links_to_crawl') do |queue_size|
-                redis_connection.scard('visited_links') do |visited_size|
+            @redis_connection.scard('links_to_crawl') do |queue_size|
+                @redis_connection.scard('visited_links') do |visited_size|
                    puts "[Crawled: #{visited_size} | Queue size: #{queue_size} | Crawled #{url}: #{title.inspect}"
-                   start_fresh_crawl(redis_connection)
+                   start_fresh_crawl()
                end
            end
        end
    end
 
-   def grab_html(url, redis_connection)
+   def grab_html(url)
     begin
         request_options = {
             :redirects => 5,
@@ -78,13 +104,12 @@ class Crawler
         end
         http.errback do 
             puts "HTTP Error for #{url}: #{http.response_header.status}"
-            next_link = @links_to_crawl.pop
-            EM.next_tick { crawl_url(next_link, redis_connection) if next_link}
+            start_fresh_crawl()
         end
 
     rescue StandardError => e
         puts "Got an Exception: #{e.message}"
-        start_fresh_crawl(redis_connection)
+        start_fresh_crawl()
     end
 end
 end
@@ -96,11 +121,13 @@ reactor_thread = Thread.new {EventMachine.run}
 sleep 1 until EventMachine.reactor_running?
 
 initial_seed_links = ['http://www.engadget.com/', 'http://techcrunch.com/']
+#The amount of parallel transmissions that run at once
 parallelism = 20
-my_crawler = Crawler.new(initial_seed_links)
+redis_connection = EM::Protocols::Redis.connect({:host => '127.0.0.1', :port => 6379, :db => 0})
+my_crawler = Crawler.new(initial_seed_links, redis_connection)
 parallelism.times do |i|
     puts "Crawler #{i+1}/#{parallelism} started"
-    my_crawler.start_fresh_crawl
+    my_crawler.start_fresh_crawl()
 end
 
 reactor_thread.join
